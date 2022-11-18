@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+
+import argparse, socket, ssl, time, copy, threading
+from datetime import datetime
+from html.parser import HTMLParser
+
+DEFAULT_SERVER = "proj5.3700.network"
+DEFAULT_PORT = 443
+FLAGS = set() # Set holding the collected flags
+
+class Crawler:
+    def __init__(self, args):
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password
+        
+        # Create the socket and wrap in TLS
+        mysocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        mysocket = ssl.wrap_socket(mysocket)
+        mysocket.connect((self.server, self.port))
+        
+        self.sock = mysocket # Main socket for the program
+        self.host = self.server + ":" + str(self.port) # Main host name
+        self.visited = [] # Links that have been visited already
+        
+        # Avoid these pages from the start
+        self.visited.append("http://khoury.northeastern.edu")
+        self.visited.append("mailto:systems-stt-admin@zimbra.ccs.neu.edu")
+        self.visited.append("/accounts/logout/")
+
+    # Send and receive a request to the server
+    def make_request(self, request):
+        # Send and receive the response
+        self.sock.send(request.encode('ascii'))
+        response = self.sock.recv(65535).decode('ascii')
+    
+        # Print out information
+        # print("Request to %s:%d" % (self.server, self.port))
+        # print(request)
+        # print("Response:\n%s" % response)
+        
+        # Deal with error codes
+        code = response[9:12]
+        if request[0:3] == "GET": # If this is a GET
+            if code == "302": # Deal with redirects
+                # Get indices before and after the request link
+                slash_idx = request.index("/")
+                http_idx = request.index("HTTP")
+               
+                # Get the redirect from the response 
+                loc_idx = response.index("Location:")
+                loc_rsp = response[loc_idx:]
+                loc_end = loc_rsp.index("\n")
+                redirect = loc_rsp[10:loc_end-1]
+            
+                # Combine and get the new request with the redirect
+                new_request = []
+                new_request.append(request[0:slash_idx])
+                new_request.append("")
+                new_request.append(request[http_idx-1:])
+                new_request = "".join(new_request)
+                response = self.make_request(new_request)
+            elif code == "500": # Deal with retries
+                response = self.make_request(request)
+        
+        # Return the response
+        return response
+    
+    # Obtains any secret flags on a given HTML page
+    def get_flags(self, response, link):
+        global FLAGS
+        # Iterate over entire HTML page
+        for i in range(len(response)):
+            # If this is a secret flag, add it to the flag set
+            if response[i:i+11] == "secret_flag":
+                flag = response[i+37:i+101]
+                FLAGS.add(flag)
+                # print(flag, link)
+    
+    # Gets all the new hyperlinks from a given HTML page
+    def get_hyperlinks(self, response):
+        result = [] # Initialize result list
+        # Iterate over entire HTML page
+        for i in range(len(response)):
+            # If this is a hyperlink, get the link and add it to the result
+            if response[i:i+4] == "href":
+                rest = response[i+6:]
+                eq_idx = rest.index("\"")
+                new_link = rest[:eq_idx]
+                # Only add the link if we haven't already visited it
+                if new_link not in self.visited:
+                    result.append(new_link)
+        return result
+    
+    # Logs into Fakebook and retrieves the sessionid cookie
+    def login_session(self):
+        # Request to get the login cookies
+        request = []
+        request.append("GET /accounts/login/?next=/fakebook/ HTTP/1.1\n")
+        request.append("Host: %s\n\n" % self.host)
+        request = "".join(request)
+        response = self.make_request(request)
+        
+        # Extract the cookies
+        csrf_idx = response.index("csrftoken=")
+        cmid_idx = response.index("csrfmiddlewaretoken")
+        csrftoken = response[csrf_idx:csrf_idx+74]
+        cmidtoken = response[cmid_idx+28:cmid_idx+92]
+        
+        # Construct the login string
+        login_str = "username=%s&password=%s&csrfmiddlewaretoken=%s" % (self.username, self.password, cmidtoken)
+        
+        # Request to get the session cookie
+        request = []
+        request.append("POST /accounts/login/?next=/fakebook/ HTTP/1.1\n")
+        request.append("Host: %s\n" % self.host)
+        request.append("Cookie: %s\n" % csrftoken)
+        request.append("Content-Type: application/x-www-form-urlencoded\n")
+        request.append("Content-Length: %d\n\n" % len(login_str))
+        request.append("%s" % login_str)
+        request = "".join(request)
+        response = self.make_request(request)
+        
+        # Extract the session cookie
+        sess_idx = response.index("sessionid=")
+        sessionid = response[sess_idx:sess_idx+42]
+        return sessionid    
+    
+    # Crawls the first page in the given list of links, using the given sessionid cookie
+    def crawl_page(self, links, sessionid):
+        # Crawl the first link in the list
+        request = []
+        request.append("GET %s HTTP/1.1\n" % links[0])
+        request.append("Host: %s\n" % self.host)
+        request.append("Cookie: %s\n\n" % sessionid)
+        request = "".join(request)
+        response = self.make_request(request)
+        
+        self.visited.append(links[0]) # Add this page to the list of visited pages
+        self.get_flags(response, links[0]) # Check if there's a hidden flag on this page
+        new_hyperlinks = self.get_hyperlinks(response) # Get all the hyperlinks from this page
+        
+        return links[1:] + new_hyperlinks # Return the rest of the links + the new links
+    
+    # Start crawling Fakebook, and add flags as encountered
+    def start_crawling(self):
+        sessionid = self.login_session() # Get the sessionid 
+        links = ["/fakebook/"] # Start crawling with just the base fakebook page
+        while len(links) != 0: # If there are no links left, stop crawling!
+            links = self.crawl_page(links, sessionid) # Get all links on this page
+
+    # Main run function for the crawler
+    def run(self):
+        self.start_crawling() # Start crawling Fakebook
+        self.sock.close() # Close the socket!
+        # print(len(self.visited))
+
+# Start 1 instance of the crawler
+def init_crawler(crawl_args):
+    try:
+        # print("Start:", datetime.now())
+        sender = Crawler(copy.deepcopy(crawl_args))
+        sender.run()
+    except:
+        pass
+    # print("End:", datetime.now())
+
+# Start 5 crawlers in parallel
+def start_crawlers(crawl_args):
+    # Create the threads
+    t1 = threading.Thread(target=init_crawler, args=(crawl_args,))
+    t2 = threading.Thread(target=init_crawler, args=(crawl_args,))
+    t3 = threading.Thread(target=init_crawler, args=(crawl_args,))
+    t4 = threading.Thread(target=init_crawler, args=(crawl_args,))
+    t5 = threading.Thread(target=init_crawler, args=(crawl_args,))
+    # Start the threads
+    t1.start()
+    t2.start()
+    t3.start()
+    t4.start()
+    t5.start()
+    # Join the threads
+    t1.join()
+    t2.join()
+    t3.join()
+    t4.join()
+    t5.join()
+    
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl Fakebook')
+    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    crawl_args = parser.parse_args()
+    
+    # Run the crawlers until it finds all flags
+    while len(FLAGS) < 5:
+        start_crawlers(crawl_args)
+    
+    # Print all the flags!
+    for i in FLAGS:
+        print(i)
